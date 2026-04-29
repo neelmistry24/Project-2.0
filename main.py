@@ -151,28 +151,35 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
 
 async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Safe TMDB GET:
-    - Network errors -> 502
-    - TMDB API errors -> 502 with detail
+    Safe TMDB GET with retry:
+    - Network timeout -> retry
+    - TMDB API errors -> 502
     """
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(f"{TMDB_BASE}{path}", params=q)
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
-        )
+    last_error = None
 
-    if r.status_code != 200:
-        raise HTTPException(
-            status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
-        )
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(f"{TMDB_BASE}{path}", params=q)
 
-    return r.json()
+            if r.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"TMDB error {r.status_code}: {r.text}"
+                )
+
+            return r.json()
+
+        except httpx.RequestError as e:
+            last_error = e
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"TMDB request error after retries: {type(last_error).__name__} | {repr(last_error)}",
+    )
 
 
 async def tmdb_cards_from_results(
@@ -267,6 +274,29 @@ def get_local_idx_by_title(title: str) -> int:
         status_code=404, detail=f"Title not found in local dataset: '{title}'"
     )
 
+def get_local_genres_by_title(title: str) -> List[str]:
+    """
+    Returns genre list for a movie title from local df.pkl.
+    Example genre text: 'Animation Comedy Family'
+    """
+    global df
+
+    if df is None or "title" not in df.columns or "genres" not in df.columns:
+        return []
+
+    key = _norm_title(title)
+
+    try:
+        matches = df[df["title"].apply(lambda x: _norm_title(x) == key)]
+    except Exception:
+        return []
+
+    if matches.empty:
+        return []
+
+    genre_text = str(matches.iloc[0].get("genres", "") or "")
+
+    return [g.strip() for g in genre_text.split() if g.strip()]
 
 def tfidf_recommend_titles(
     query_title: str, top_n: int = 10
@@ -368,10 +398,9 @@ async def home(
     limit: int = Query(24, ge=1, le=50),
 ):
     """
-    Home feed for Streamlit (posters).
-    category:
-      - trending (trending/movie/day)
-      - popular, top_rated, upcoming, now_playing  (movie/{category})
+    Home feed for Streamlit.
+    Primary: TMDB API.
+    Fallback: local df.pkl titles if TMDB is unavailable.
     """
     try:
         if category == "trending":
@@ -384,10 +413,34 @@ async def home(
         data = await tmdb_get(f"/movie/{category}", {"language": "en-US", "page": 1})
         return await tmdb_cards_from_results(data.get("results", []), limit=limit)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Home route failed: {e}")
+    except Exception:
+        global df
+
+        if df is None or "title" not in df.columns:
+            raise HTTPException(status_code=503, detail="Home feed unavailable")
+
+        fallback_movies = df.head(limit)
+
+        cards = []
+        for _, row in fallback_movies.iterrows():
+            vote_average = None
+            if "vote_average" in df.columns and pd.notna(row.get("vote_average")):
+                try:
+                    vote_average = float(row.get("vote_average"))
+                except Exception:
+                    vote_average = None
+
+            cards.append(
+                TMDBMovieCard(
+                    tmdb_id=0,
+                    title=str(row["title"]),
+                    poster_url=None,
+                    release_date=None,
+                    vote_average=vote_average,
+                )
+            )
+
+        return cards
 
 
 # ---------- TMDB KEYWORD SEARCH (MULTIPLE RESULTS) ----------
@@ -593,6 +646,125 @@ def my_ratings(current_user: dict = Depends(get_current_user)):
     return {
         "user": current_user["username"],
         "ratings": response.data
+    }
+
+@app.get("/for-you")
+async def for_you(
+    genres: Optional[List[str]] = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Personalized recommendations based on:
+    - user high ratings
+    - TF-IDF similarity
+    - optional genre filter
+    """
+
+    # Get all ratings for this user
+    all_ratings_response = (
+        supabase
+        .table("ratings")
+        .select("*")
+        .eq("user_id", current_user["user_id"])
+        .execute()
+    )
+
+    all_user_ratings = all_ratings_response.data or []
+
+    # Store movies this user already rated
+    already_rated_tmdb_ids = {
+        int(r["tmdb_id"])
+        for r in all_user_ratings
+        if r.get("tmdb_id") is not None
+    }
+
+    # Use only 4 or 5 star ratings
+    liked_ratings = [
+        r for r in all_user_ratings
+        if int(r.get("rating", 0)) >= 4
+    ]
+
+    if not liked_ratings:
+        return {
+            "user": current_user["username"],
+            "selected_genres": genres or [],
+            "message": "Rate movies 4 or 5 stars to get personalized recommendations.",
+            "recommendations": []
+        }
+
+    selected_genres = [g.lower() for g in (genres or [])]
+
+    all_recs = []
+    seen_tmdb_ids = set()
+    seen_titles = set()
+
+    for item in liked_ratings[:5]:
+        liked_tmdb_id = item.get("tmdb_id")
+
+        try:
+            # Convert liked TMDB ID to movie title
+            details = await tmdb_movie_details(int(liked_tmdb_id))
+            liked_title = details.title
+
+            # Use your existing TF-IDF model
+            recs = tfidf_recommend_titles(liked_title, top_n=15)
+
+            for rec_title, score in recs:
+                normalized_title = _norm_title(rec_title)
+
+                # Avoid duplicate titles
+                if normalized_title in seen_titles:
+                    continue
+
+                # Get local genres from df.pkl
+                local_genres = get_local_genres_by_title(rec_title)
+                local_genres_lower = [g.lower() for g in local_genres]
+
+                # Apply genre filter only if user selected genres
+                if selected_genres:
+                    if not any(g in local_genres_lower for g in selected_genres):
+                        continue
+
+                # Attach TMDB poster/details
+                card = await attach_tmdb_card_by_title(rec_title)
+
+                if not card:
+                    continue
+
+                # Avoid items without posters
+                if not card.poster_url:
+                    continue
+
+                # Avoid very poor TMDB matches
+                if card.vote_average is not None and card.vote_average == 0:
+                    continue
+
+                # Exclude movies user already rated
+                if int(card.tmdb_id) in already_rated_tmdb_ids:
+                    continue
+
+                # Avoid duplicate TMDB IDs
+                if int(card.tmdb_id) in seen_tmdb_ids:
+                    continue
+
+                seen_titles.add(normalized_title)
+                seen_tmdb_ids.add(int(card.tmdb_id))
+
+                all_recs.append({
+                    "because_you_liked": liked_title,
+                    "title": rec_title,
+                    "score": score,
+                    "local_genres": local_genres,
+                    "tmdb": card.dict()
+                })
+
+        except Exception:
+            continue
+
+    return {
+        "user": current_user["username"],
+        "selected_genres": genres or [],
+        "recommendations": all_recs[:20]
     }
 
 @app.get("/test-db")
