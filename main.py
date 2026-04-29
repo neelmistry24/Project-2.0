@@ -1,6 +1,7 @@
 import os
 import pickle
 from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -9,9 +10,13 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from jose import jwt
+
 from auth import hash_password, verify_password
 from db import supabase
 from schemas import UserCreate, UserLogin
+
+
 
 
 # =========================
@@ -22,6 +27,13 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
+
+# =========================
+# JWT CONFIG
+# =========================
+SECRET_KEY = "personaflix_secret_key"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 if not TMDB_API_KEY:
     # Don't crash import-time in production if you prefer; but for you better fail early:
@@ -97,6 +109,13 @@ class SearchBundleResponse(BaseModel):
 # =========================
 # UTILS
 # =========================
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
 def _norm_title(t: str) -> str:
     return str(t).strip().lower()
 
@@ -480,27 +499,40 @@ async def search_bundle(
 
 @app.post("/register")
 def register(user: UserCreate):
-    try:
-        print("STEP 1: Input received")
-        print(user)
+    hashed_pw = hash_password(user.password)
 
-        hashed_pw = hash_password(user.password)
-        print("STEP 2: Password hashed")
+    data = {
+        "username": user.username,
+        "password_hash": hashed_pw
+    }
 
-        data = {
-            "username": user.username,
-            "password_hash": hashed_pw
-        }
-        print("STEP 3: Data prepared", data)
+    supabase.table("users").insert(data).execute()
 
-        response = supabase.table("users").insert(data).execute()
-        print("STEP 4: DB response", response)
+    return {"message": "User registered successfully"}
 
-        return {"message": "User registered successfully"}
+@app.post("/login")
+def login(user: UserLogin):
+    response = supabase.table("users").select("*").eq("username", user.username).execute()
 
-    except Exception as e:
-        print("❌ ERROR OCCURRED:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    if not response.data:
+        raise HTTPException(status_code=400, detail="User not found")
+
+    db_user = response.data[0]
+
+    if not verify_password(user.password, db_user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Invalid password")
+
+    token = create_access_token({
+        "user_id": db_user["id"],
+        "username": db_user["username"]
+    })
+
+    return {
+        "message": "Login successful",
+        "access_token": token,
+        "token_type": "bearer",
+        "username": db_user["username"]
+    }    
 
 @app.get("/test-db")
 def test_db():
