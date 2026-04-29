@@ -9,3 +9,7 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
+
+class RatingCreate(BaseModel):
+    tmdb_id: int
+    rating: int

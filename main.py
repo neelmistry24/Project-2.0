@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ from jose import jwt
 
 from auth import hash_password, verify_password
 from db import supabase
-from schemas import UserCreate, UserLogin
+from schemas import UserCreate, UserLogin, RatingCreate
 
 
 
@@ -34,6 +35,8 @@ TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 SECRET_KEY = "personaflix_secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+security = HTTPBearer()
 
 if not TMDB_API_KEY:
     # Don't crash import-time in production if you prefer; but for you better fail early:
@@ -115,6 +118,26 @@ def create_access_token(data: dict):
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+        user_id = payload.get("user_id")
+        username = payload.get("username")
+
+        if not user_id or not username:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+
+        return {
+            "user_id": user_id,
+            "username": username
+        }
+
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def _norm_title(t: str) -> str:
     return str(t).strip().lower()
@@ -533,6 +556,44 @@ def login(user: UserLogin):
         "token_type": "bearer",
         "username": db_user["username"]
     }    
+
+@app.post("/rate")
+def rate_movie(
+    rating_data: RatingCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    if rating_data.rating < 1 or rating_data.rating > 5:
+        raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
+
+    data = {
+        "user_id": current_user["user_id"],
+        "tmdb_id": rating_data.tmdb_id,
+        "rating": rating_data.rating
+    }
+
+    supabase.table("ratings").insert(data).execute()
+
+    return {
+        "message": "Rating saved successfully",
+        "user": current_user["username"],
+        "tmdb_id": rating_data.tmdb_id,
+        "rating": rating_data.rating
+    }
+
+@app.get("/my-ratings")
+def my_ratings(current_user: dict = Depends(get_current_user)):
+    response = (
+        supabase
+        .table("ratings")
+        .select("*")
+        .eq("user_id", current_user["user_id"])
+        .execute()
+    )
+
+    return {
+        "user": current_user["username"],
+        "ratings": response.data
+    }
 
 @app.get("/test-db")
 def test_db():
