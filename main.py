@@ -9,6 +9,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from auth import hash_password, verify_password
+from db import supabase
+from schemas import UserCreate, UserLogin
 
 
 # =========================
@@ -474,3 +477,31 @@ async def search_bundle(
         tfidf_recommendations=tfidf_items,
         genre_recommendations=genre_recs,
     )
+
+@app.post("/register")
+def register(user: UserCreate):
+    try:
+        print("STEP 1: Input received")
+        print(user)
+
+        hashed_pw = hash_password(user.password)
+        print("STEP 2: Password hashed")
+
+        data = {
+            "username": user.username,
+            "password_hash": hashed_pw
+        }
+        print("STEP 3: Data prepared", data)
+
+        response = supabase.table("users").insert(data).execute()
+        print("STEP 4: DB response", response)
+
+        return {"message": "User registered successfully"}
+
+    except Exception as e:
+        print("❌ ERROR OCCURRED:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test-db")
+def test_db():
+    return {"message": "Supabase connected successfully"}
