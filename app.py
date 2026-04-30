@@ -559,11 +559,12 @@ if st.session_state.view == "home":
         if selected_genres:
             for_you_params["genres"] = selected_genres
 
-        for_you_data, for_you_err = api_get_json_auth(
-            "/for-you",
-            params=for_you_params,
-            token=st.session_state.token,
-        )
+        with st.spinner("Building your personalized recommendations..."):
+            for_you_data, for_you_err = api_get_json_auth(
+                "/for-you",
+                params=for_you_params,
+                token=st.session_state.token,
+            )
 
         if for_you_err:
             st.info("Rate a few movies to unlock personalized recommendations.")
@@ -635,9 +636,11 @@ if st.session_state.view == "home":
     # =============================
     st.markdown(f"### 🏠 Home — {home_category.replace('_',' ').title()}")
 
-    home_cards, err = api_get_json(
-        "/home", params={"category": home_category, "limit": 24}
-    )
+    with st.spinner(f"Loading {home_category.replace('_', ' ').title()} movies..."):
+        home_cards, err = api_get_json(
+            "/home",
+            params={"category": home_category, "limit": 24}
+        )
     if err or not home_cards:
         st.error(f"Home feed failed: {err or 'Unknown error'}")
         st.stop()
@@ -650,10 +653,11 @@ if st.session_state.view == "home":
 elif st.session_state.view == "my_ratings":
     st.markdown(f"### ⭐ My Ratings — {st.session_state.username}")
 
-    ratings_data, ratings_err = api_get_json_auth(
-        "/my-ratings/details",
-        token=st.session_state.token,
-    )
+    with st.spinner("Loading your rated movies..."):
+        ratings_data, ratings_err = api_get_json_auth(
+            "/my-ratings/details",
+            token=st.session_state.token,
+        )
 
     if ratings_err:
         st.error(f"Could not load ratings: {ratings_err}")
@@ -722,10 +726,12 @@ elif st.session_state.view == "details":
             go_back_from_details()
 
     # Details (your FastAPI safe route)
-    data, err = api_get_json(f"/movie/id/{tmdb_id}")
-    if err or not data:
-        st.error(f"Could not load details: {err or 'Unknown error'}")
-        st.stop()
+    with st.spinner("Loading movie details..."):
+        data, err = api_get_json(f"/movie/id/{tmdb_id}")
+
+        if err or not data:
+            st.error(f"Could not load details: {err or 'Unknown error'}")
+            st.stop()
 
     # Layout: Poster LEFT, Details RIGHT
     left, right = st.columns([1, 2.4], gap="large")
@@ -828,10 +834,11 @@ elif st.session_state.view == "details":
     # Recommendations (TF-IDF + Genre) via your bundle endpoint
     title = (data.get("title") or "").strip()
     if title:
-        bundle, err2 = api_get_json(
-            "/movie/search",
-            params={"query": title, "tfidf_top_n": 12, "genre_limit": 12},
-        )
+        with st.spinner("Finding similar movies..."):
+            bundle, err2 = api_get_json(
+                "/movie/search",
+                params={"query": title, "tfidf_top_n": 12, "genre_limit": 12},
+            )
 
         if not err2 and bundle:
             st.markdown("#### 🔎 Similar Movies (TF-IDF)")
