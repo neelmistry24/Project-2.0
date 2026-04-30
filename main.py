@@ -624,7 +624,7 @@ def rate_movie(
         "rating": rating_data.rating
     }
 
-    supabase.table("ratings").insert(data).execute()
+    supabase.table("ratings").upsert(data,on_conflict="user_id,tmdb_id").execute()
 
     return {
         "message": "Rating saved successfully",
