@@ -12,7 +12,7 @@ GENRE_OPTIONS = [
     "Adventure",
     "Animation",
     "Comedy",
-    "Crime",
+    "Crime", 
     "Drama",
     "Family",
     "Fantasy",
@@ -44,9 +44,13 @@ st.markdown(
 # STATE + ROUTING (single-file pages)
 # =============================
 if "view" not in st.session_state:
-    st.session_state.view = "home"  # home | details
+    st.session_state.view = "home"  # home | details | my_ratings
+
 if "selected_tmdb_id" not in st.session_state:
     st.session_state.selected_tmdb_id = None
+
+if "previous_view" not in st.session_state:
+    st.session_state.previous_view = "home"
 
 # =============================
 # AUTH SESSION STATE
@@ -63,32 +67,78 @@ if "is_logged_in" not in st.session_state:
 if "for_you_page" not in st.session_state:
     st.session_state.for_you_page = 1
 
+# =============================
+# QUERY PARAM ROUTING
+# =============================
 qp_view = st.query_params.get("view")
 qp_id = st.query_params.get("id")
-if qp_view in ("home", "details"):
+
+if qp_view in ("home", "details", "my_ratings"):
     st.session_state.view = qp_view
-if qp_id:
+
+# Important:
+# Only read id when URL view is details.
+# This prevents old movie id like Toy Story from forcing details again.
+if qp_view == "details" and qp_id:
     try:
         st.session_state.selected_tmdb_id = int(qp_id)
-        st.session_state.view = "details"
-    except:
+    except Exception:
         pass
 
 
 def goto_home():
     st.session_state.view = "home"
+    st.session_state.selected_tmdb_id = None
+    st.session_state.previous_view = "home"
+
+    st.query_params.clear()
     st.query_params["view"] = "home"
-    if "id" in st.query_params:
-        del st.query_params["id"]
+
     st.rerun()
 
 
-def goto_details(tmdb_id: int):
+def goto_my_ratings():
+    st.session_state.view = "my_ratings"
+    st.session_state.selected_tmdb_id = None
+    st.session_state.previous_view = "home"
+
+    st.query_params.clear()
+    st.query_params["view"] = "my_ratings"
+
+    st.rerun()
+
+
+def goto_details(tmdb_id, source: str | None = None):
+    try:
+        clean_tmdb_id = int(tmdb_id)
+    except Exception:
+        st.error(f"Invalid movie ID: {tmdb_id}")
+        return
+
+    if clean_tmdb_id <= 0:
+        st.error("This movie cannot be opened because it has no valid TMDB ID.")
+        return
+
+    if source:
+        st.session_state.previous_view = source
+    else:
+        st.session_state.previous_view = st.session_state.view
+
     st.session_state.view = "details"
-    st.session_state.selected_tmdb_id = int(tmdb_id)
+    st.session_state.selected_tmdb_id = clean_tmdb_id
+
+    st.query_params.clear()
     st.query_params["view"] = "details"
-    st.query_params["id"] = str(int(tmdb_id))
+    st.query_params["id"] = str(clean_tmdb_id)
+
     st.rerun()
+
+
+def go_back_from_details():
+    if st.session_state.previous_view == "my_ratings":
+        goto_my_ratings()
+    else:
+        goto_home()
 
 
 # =============================
@@ -245,12 +295,17 @@ def poster_grid(cards, cols=6, key_prefix="grid"):
                 else:
                     st.write("🖼️ No poster")
 
-                if st.button("Open", key=f"{key_prefix}_{r}_{c}_{idx}_{tmdb_id}"):
-                    if tmdb_id:
-                        goto_details(tmdb_id)
+                open_key = f"open_{key_prefix}_{r}_{c}_{idx}_{tmdb_id}_{title}"
+
+                if st.button("Open", key=open_key):
+                    if tmdb_id is None:
+                        st.error("Movie ID missing. Cannot open this movie.")
+                    else:
+                        goto_details(tmdb_id, source=st.session_state.view)
 
                 st.markdown(
-                    f"<div class='movie-title'>{title}</div>", unsafe_allow_html=True
+                    f"<div class='movie-title'>{title}</div>",
+                    unsafe_allow_html=True
                 )
 
 
@@ -401,6 +456,11 @@ with st.sidebar:
     if st.button("🏠 Home"):
         st.session_state.for_you_page = 1
         goto_home()
+
+    if st.button("⭐ My Ratings"):
+        st.session_state.view = "my_ratings"
+        st.query_params["view"] = "my_ratings"
+        st.rerun()
 
     st.markdown("---")
 
@@ -585,14 +645,72 @@ if st.session_state.view == "home":
     poster_grid(home_cards, cols=grid_cols, key_prefix="home_feed")
 
 # ==========================================================
+# VIEW: MY RATINGS
+# ==========================================================
+elif st.session_state.view == "my_ratings":
+    st.markdown(f"### ⭐ My Ratings — {st.session_state.username}")
+
+    ratings_data, ratings_err = api_get_json_auth(
+        "/my-ratings/details",
+        token=st.session_state.token,
+    )
+
+    if ratings_err:
+        st.error(f"Could not load ratings: {ratings_err}")
+        st.stop()
+
+    ratings = ratings_data.get("ratings", []) if ratings_data else []
+
+    if not ratings:
+        st.info("You have not rated any movies yet.")
+        if st.button("🏠 Go to Home"):
+            goto_home()
+        st.stop()
+
+    st.caption(f"You have rated {len(ratings)} movie(s).")
+
+    cols = st.columns(grid_cols)
+
+    for idx, item in enumerate(ratings):
+        movie = item.get("movie") or {}
+        rating_value = item.get("rating")
+        tmdb_id = movie.get("tmdb_id") or item.get("tmdb_id")
+
+        with cols[idx % grid_cols]:
+            poster_url = movie.get("poster_url")
+
+            if poster_url:
+                st.image(poster_url, use_column_width=True)
+            else:
+                st.markdown(
+                    "<div style='height:260px; border-radius:14px; background:#222; display:flex; align-items:center; justify-content:center; color:#aaa;'>No Poster</div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(f"**{movie.get('title', 'Unknown Movie')}**")
+            st.caption(f"Your rating: ⭐ {rating_value}/5")
+
+            if movie.get("release_date"):
+                st.caption(f"Release: {movie.get('release_date')}")
+
+            if st.button("Open", key=f"my_rating_open_{idx}_{tmdb_id}"):
+                goto_details(int(tmdb_id), source="my_ratings")
+
+# ==========================================================
 # VIEW: DETAILS
 # ==========================================================
 elif st.session_state.view == "details":
     tmdb_id = st.session_state.selected_tmdb_id
-    if not tmdb_id:
-        st.warning("No movie selected.")
-        if st.button("← Back to Home"):
-            goto_home()
+
+    try:
+        tmdb_id = int(tmdb_id)
+    except Exception:
+        tmdb_id = None
+
+    if tmdb_id is None or tmdb_id <= 0:
+        st.warning("No valid movie selected.")
+        if st.button("← Back"):
+            go_back_from_details()
         st.stop()
 
     # Top bar
@@ -600,8 +718,8 @@ elif st.session_state.view == "details":
     with a:
         st.markdown("### 📄 Movie Details")
     with b:
-        if st.button("← Back to Home"):
-            goto_home()
+        if st.button("← Back"):
+            go_back_from_details()
 
     # Details (your FastAPI safe route)
     data, err = api_get_json(f"/movie/id/{tmdb_id}")
@@ -642,15 +760,42 @@ elif st.session_state.view == "details":
         st.markdown("---")
         st.markdown("### ⭐ Rate this movie")
 
+        existing_rating = None
+
+        # Load current user's saved rating for this movie
+        if st.session_state.token and tmdb_id and int(tmdb_id) != 0:
+            ratings_data, ratings_err = api_get_json_auth(
+                "/my-ratings",
+                token=st.session_state.token,
+            )
+
+            if not ratings_err and ratings_data:
+                for item in ratings_data.get("ratings", []):
+                    try:
+                        if int(item.get("tmdb_id")) == int(tmdb_id):
+                            existing_rating = int(item.get("rating"))
+                            break
+                    except Exception:
+                        pass
+
+        default_rating = existing_rating if existing_rating is not None else 3
+
+        if existing_rating is not None:
+            st.caption(f"Your current rating: ⭐ {existing_rating}/5")
+        else:
+            st.caption("You have not rated this movie yet.")
+
         user_rating = st.slider(
             "Select your rating",
             min_value=1,
             max_value=5,
-            value=3,
-            key=f"rating_slider_{tmdb_id}"
+            value=default_rating,
+            key=f"rating_slider_{tmdb_id}_{default_rating}"
         )
 
-        if st.button("Save Rating", key=f"save_rating_{tmdb_id}"):
+        button_label = "Update Rating" if existing_rating is not None else "Save Rating"
+
+        if st.button(button_label, key=f"save_rating_{tmdb_id}_{default_rating}"):
             if not st.session_state.token:
                 st.error("Please login first.")
             elif not tmdb_id or int(tmdb_id) == 0:
@@ -668,7 +813,8 @@ elif st.session_state.view == "details":
                 if rate_err:
                     st.error(f"Rating failed: {rate_err}")
                 else:
-                    st.success("Rating saved successfully!")
+                    st.success("Rating updated successfully!")
+                    st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
 

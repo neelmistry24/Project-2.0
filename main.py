@@ -648,6 +648,66 @@ def my_ratings(current_user: dict = Depends(get_current_user)):
         "ratings": response.data
     }
 
+@app.get("/my-ratings/details")
+async def my_ratings_details(current_user: dict = Depends(get_current_user)):
+    """
+    Returns logged-in user's ratings with TMDB movie details.
+    Used by Streamlit My Ratings page.
+    """
+    response = (
+        supabase
+        .table("ratings")
+        .select("*")
+        .eq("user_id", current_user["user_id"])
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    ratings = response.data or []
+
+    detailed_ratings = []
+
+    for item in ratings:
+        tmdb_id = item.get("tmdb_id")
+
+        try:
+            details = await tmdb_movie_details(int(tmdb_id))
+
+            detailed_ratings.append({
+                "rating_id": item.get("id"),
+                "tmdb_id": tmdb_id,
+                "rating": item.get("rating"),
+                "created_at": item.get("created_at"),
+                "movie": {
+                    "tmdb_id": details.tmdb_id,
+                    "title": details.title,
+                    "poster_url": details.poster_url,
+                    "release_date": details.release_date,
+                    "vote_average": details.vote_average if hasattr(details, "vote_average") else None,
+                }
+            })
+
+        except Exception:
+            # Fallback if TMDB fails for any movie
+            detailed_ratings.append({
+                "rating_id": item.get("id"),
+                "tmdb_id": tmdb_id,
+                "rating": item.get("rating"),
+                "created_at": item.get("created_at"),
+                "movie": {
+                    "tmdb_id": tmdb_id,
+                    "title": f"Movie ID {tmdb_id}",
+                    "poster_url": None,
+                    "release_date": None,
+                    "vote_average": None,
+                }
+            })
+
+    return {
+        "user": current_user["username"],
+        "ratings": detailed_ratings
+    }
+
 @app.get("/for-you")
 async def for_you(
     genres: Optional[List[str]] = Query(None),
