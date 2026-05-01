@@ -29,6 +29,23 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
+TMDB_GENRE_MAP = {
+    "Action": 28,
+    "Adventure": 12,
+    "Animation": 16,
+    "Comedy": 35,
+    "Crime": 80,
+    "Drama": 18,
+    "Family": 10751,
+    "Fantasy": 14,
+    "Horror": 27,
+    "Mystery": 9648,
+    "Romance": 10749,
+    "Science": 878,
+    "Science Fiction": 878,
+    "Thriller": 53,
+}
+
 # =========================
 # JWT CONFIG
 # =========================
@@ -873,61 +890,78 @@ async def for_you(
             # Movie probably not found in local df.pkl
             tfidf_added_count = 0
 
-        # ==================================================
+                # ==================================================
         # FALLBACK PATH: TMDB genre recommendations
-        # Used when TF-IDF produces no useful result
+        # Used when TF-IDF produces no useful result.
+        #
+        # Strict genre rule:
+        # - If user selected genres, fallback must use selected genres.
+        # - If no genre selected, fallback uses liked movie's first genre.
         # ==================================================
         if tfidf_added_count == 0:
             try:
-                if not liked_details or not liked_details.genres:
-                    continue
+                fallback_genre_ids = []
 
-                genre_id = liked_details.genres[0]["id"]
-                fallback_data = await tmdb_get(
-                    "/discover/movie",
-                    {
-                        "with_genres": genre_id,
-                        "language": "en-US",
-                        "sort_by": "popularity.desc",
-                        "page": 1,
-                    },
-                )
+                # User-selected genre filter has highest priority
+                if genres:
+                    for genre_name in genres:
+                        genre_id = TMDB_GENRE_MAP.get(genre_name)
+                        if genre_id:
+                            fallback_genre_ids.append(genre_id)
 
-                fallback_cards = await tmdb_cards_from_results(
-                    fallback_data.get("results", []),
-                    limit=15
-                )
-
-                for card in fallback_cards:
-                    if not card:
+                # If no selected genre is available, use liked movie's first TMDB genre
+                if not fallback_genre_ids:
+                    if not liked_details or not liked_details.genres:
                         continue
+                    fallback_genre_ids.append(liked_details.genres[0]["id"])
 
-                    if not card.poster_url:
-                        continue
+                for fallback_genre_id in fallback_genre_ids:
+                    fallback_data = await tmdb_get(
+                        "/discover/movie",
+                        {
+                            "with_genres": fallback_genre_id,
+                            "language": "en-US",
+                            "sort_by": "popularity.desc",
+                            "page": 1,
+                        },
+                    )
 
-                    if card.vote_average is not None and card.vote_average == 0:
-                        continue
+                    fallback_cards = await tmdb_cards_from_results(
+                        fallback_data.get("results", []),
+                        limit=15
+                    )
 
-                    if int(card.tmdb_id) in already_rated_tmdb_ids:
-                        continue
+                    for card in fallback_cards:
+                        if not card:
+                            continue
 
-                    if int(card.tmdb_id) in seen_tmdb_ids:
-                        continue
+                        if not card.poster_url:
+                            continue
 
-                    # Genre selected by user cannot be perfectly checked here
-                    # because TMDB card does not include full genre list.
-                    # So fallback keeps TMDB's genre-based results.
-                    seen_tmdb_ids.add(int(card.tmdb_id))
-                    seen_titles.add(_norm_title(card.title))
+                        if card.vote_average is not None and card.vote_average == 0:
+                            continue
 
-                    all_recs.append({
-                        "source": "tmdb_genre_fallback",
-                        "because_you_liked": liked_title,
-                        "title": card.title,
-                        "score": None,
-                        "local_genres": [],
-                        "tmdb": card.dict()
-                    })
+                        if int(card.tmdb_id) in already_rated_tmdb_ids:
+                            continue
+
+                        if int(card.tmdb_id) in seen_tmdb_ids:
+                            continue
+
+                        seen_tmdb_ids.add(int(card.tmdb_id))
+                        seen_titles.add(_norm_title(card.title))
+
+                        # If selected genres exist, record them as fallback genres.
+                        # This keeps frontend/debug response understandable.
+                        fallback_genres = genres or []
+
+                        all_recs.append({
+                            "source": "tmdb_genre_fallback",
+                            "because_you_liked": liked_title,
+                            "title": card.title,
+                            "score": None,
+                            "local_genres": fallback_genres,
+                            "tmdb": card.dict()
+                        })
 
             except Exception:
                 continue
