@@ -298,6 +298,29 @@ def get_local_genres_by_title(title: str) -> List[str]:
 
     return [g.strip() for g in genre_text.split() if g.strip()]
 
+def get_local_title_by_tmdb_id(tmdb_id: int) -> Optional[str]:
+    """
+    Returns local movie title from df.pkl using TMDB/movie id if available.
+    This helps For You work even when TMDB API is temporarily unavailable.
+    """
+    global df
+
+    if df is None:
+        return None
+
+    possible_id_columns = ["tmdb_id", "id", "movie_id"]
+
+    for col in possible_id_columns:
+        if col in df.columns:
+            try:
+                matches = df[df[col].astype(str) == str(tmdb_id)]
+                if not matches.empty and "title" in df.columns:
+                    return str(matches.iloc[0]["title"])
+            except Exception:
+                pass
+
+    return None
+
 def tfidf_recommend_titles(
     query_title: str, top_n: int = 10
 ) -> List[Tuple[str, float]]:
@@ -715,12 +738,13 @@ async def for_you(
 ):
     """
     Personalized recommendations based on:
-    - user high ratings
-    - TF-IDF similarity
-    - optional genre filter
+    - user's high-rated movies
+    - TF-IDF similarity when movie exists in local dataset
+    - TMDB genre fallback when movie is not in local dataset
+    - optional genre preference filter
     """
 
-    # Get all ratings for this user
+    # 1. Get all ratings for this user
     all_ratings_response = (
         supabase
         .table("ratings")
@@ -731,14 +755,21 @@ async def for_you(
 
     all_user_ratings = all_ratings_response.data or []
 
-    # Store movies this user already rated
+    if not all_user_ratings:
+        return {
+            "user": current_user["username"],
+            "selected_genres": genres or [],
+            "message": "Rate your first movie to unlock personalized recommendations.",
+            "recommendations": []
+        }
+
     already_rated_tmdb_ids = {
         int(r["tmdb_id"])
         for r in all_user_ratings
         if r.get("tmdb_id") is not None
     }
 
-    # Use only 4 or 5 star ratings
+    # 2. Use only 4 or 5 star ratings as recommendation seeds
     liked_ratings = [
         r for r in all_user_ratings
         if int(r.get("rating", 0)) >= 4
@@ -748,7 +779,7 @@ async def for_you(
         return {
             "user": current_user["username"],
             "selected_genres": genres or [],
-            "message": "Rate movies 4 or 5 stars to get personalized recommendations.",
+            "message": "Rate at least one movie 4 or 5 stars to unlock personalized recommendations.",
             "recommendations": []
         }
 
@@ -758,59 +789,79 @@ async def for_you(
     seen_tmdb_ids = set()
     seen_titles = set()
 
+    # 3. Generate recommendations from up to 5 liked movies
     for item in liked_ratings[:5]:
         liked_tmdb_id = item.get("tmdb_id")
 
-        try:
-            # Convert liked TMDB ID to movie title
-            details = await tmdb_movie_details(int(liked_tmdb_id))
-            liked_title = details.title
+        liked_details = None
+        liked_title = None
 
-            # Use your existing TF-IDF model
+        # First try TMDB details
+        try:
+            liked_details = await tmdb_movie_details(int(liked_tmdb_id))
+            liked_title = liked_details.title
+        except Exception:
+            # If TMDB is unavailable, fall back to local dataset title
+            liked_title = get_local_title_by_tmdb_id(int(liked_tmdb_id))
+
+        if not liked_title:
+            continue
+
+        # ==================================================
+        # PRIMARY PATH: TF-IDF recommendations
+        # ==================================================
+        tfidf_added_count = 0
+
+        try:
             recs = tfidf_recommend_titles(liked_title, top_n=15)
 
             for rec_title, score in recs:
+                # Skip weak recommendations
+                if score < 0.17:
+                    continue
                 normalized_title = _norm_title(rec_title)
 
-                # Avoid duplicate titles
+
                 if normalized_title in seen_titles:
                     continue
 
-                # Get local genres from df.pkl
+
                 local_genres = get_local_genres_by_title(rec_title)
                 local_genres_lower = [g.lower() for g in local_genres]
 
-                # Apply genre filter only if user selected genres
+                # Apply genre preference filter if selected
                 if selected_genres:
                     if not any(g in local_genres_lower for g in selected_genres):
                         continue
 
-                # Attach TMDB poster/details
+
                 card = await attach_tmdb_card_by_title(rec_title)
 
                 if not card:
                     continue
 
-                # Avoid items without posters
+
                 if not card.poster_url:
                     continue
 
-                # Avoid very poor TMDB matches
+
                 if card.vote_average is not None and card.vote_average == 0:
                     continue
 
-                # Exclude movies user already rated
+
                 if int(card.tmdb_id) in already_rated_tmdb_ids:
                     continue
 
-                # Avoid duplicate TMDB IDs
+
                 if int(card.tmdb_id) in seen_tmdb_ids:
                     continue
 
                 seen_titles.add(normalized_title)
                 seen_tmdb_ids.add(int(card.tmdb_id))
+                tfidf_added_count += 1
 
                 all_recs.append({
+                    "source": "tfidf",
                     "because_you_liked": liked_title,
                     "title": rec_title,
                     "score": score,
@@ -819,12 +870,80 @@ async def for_you(
                 })
 
         except Exception:
-            continue
+            # Movie probably not found in local df.pkl
+            tfidf_added_count = 0
+
+        # ==================================================
+        # FALLBACK PATH: TMDB genre recommendations
+        # Used when TF-IDF produces no useful result
+        # ==================================================
+        if tfidf_added_count == 0:
+            try:
+                if not liked_details or not liked_details.genres:
+                    continue
+
+                genre_id = liked_details.genres[0]["id"]
+                fallback_data = await tmdb_get(
+                    "/discover/movie",
+                    {
+                        "with_genres": genre_id,
+                        "language": "en-US",
+                        "sort_by": "popularity.desc",
+                        "page": 1,
+                    },
+                )
+
+                fallback_cards = await tmdb_cards_from_results(
+                    fallback_data.get("results", []),
+                    limit=15
+                )
+
+                for card in fallback_cards:
+                    if not card:
+                        continue
+
+                    if not card.poster_url:
+                        continue
+
+                    if card.vote_average is not None and card.vote_average == 0:
+                        continue
+
+                    if int(card.tmdb_id) in already_rated_tmdb_ids:
+                        continue
+
+                    if int(card.tmdb_id) in seen_tmdb_ids:
+                        continue
+
+                    # Genre selected by user cannot be perfectly checked here
+                    # because TMDB card does not include full genre list.
+                    # So fallback keeps TMDB's genre-based results.
+                    seen_tmdb_ids.add(int(card.tmdb_id))
+                    seen_titles.add(_norm_title(card.title))
+
+                    all_recs.append({
+                        "source": "tmdb_genre_fallback",
+                        "because_you_liked": liked_title,
+                        "title": card.title,
+                        "score": None,
+                        "local_genres": [],
+                        "tmdb": card.dict()
+                    })
+
+            except Exception:
+                continue
+
+    if not all_recs:
+        return {
+            "user": current_user["username"],
+            "selected_genres": genres or [],
+            "message": "No personalized recommendations found yet. Try rating a few more movies 4 or 5 stars.",
+            "recommendations": []
+        }
 
     return {
         "user": current_user["username"],
         "selected_genres": genres or [],
-        "recommendations": all_recs[:20]
+        "recommendations": all_recs[:30]
     }
 
 @app.get("/test-db")
